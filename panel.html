@@ -135,7 +135,7 @@ const T = {
     steps: [
       '按全局快捷键（或点上方大按钮）→ 麦克风立刻进入炸麦破音状态',
       '对方听到的音量与你的输入保持一致，只是声音「炸了」',
-      '再按一次快捷键（或再点按钮）→ 恢复正常；开关均有 10 ms 淡变，无咔哒声',
+      '再按一次快捷键（或再点按钮）→ 当帧立刻恢复正常（瞬时开关，零延迟）',
     ],
     note: '提示：效果只在 MicYou 串流运行时送达对方（音频线程在处理链上调用本插件）。建议把本插件节点保持在处理链末尾（VAD 之后），避免宿主降噪/AGC 抹平失真。安静片段不会炸——只有顶到削波的声音才破音，听感更自然。',
     errPrefix: '错误：',
@@ -152,7 +152,7 @@ const T = {
     steps: [
       'Press the global hotkey (or the big button above) — your mic instantly blows up into clipping distortion',
       'Peers hear the same loudness as your input; only the timbre is destroyed',
-      'Press again to return to normal; both directions cross-fade over 10 ms (click-free)',
+      'Press again to return to normal instantly (zero-latency hard switch)',
     ],
     note: 'Note: the effect only reaches peers while MicYou is streaming. Keep this plugin node at the end of the processing chain (after VAD) so host noise reduction / AGC does not smooth the distortion away. Quiet passages stay clean — only signal that actually hits the ceiling peaks, which sounds more natural.',
     errPrefix: 'Error: ',

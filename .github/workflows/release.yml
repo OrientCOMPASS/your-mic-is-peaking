@@ -5,6 +5,8 @@ name: Build & Release
 #     仅自动构建 development build：三平台矩阵编译 + 单测，产物作为
 #     Actions artifact（your-mic-is-peaking-development，三库单包目录），
 #     **绝不创建 release / tag**。
+#   * macOS 产物为 arm64 + x86_64 的 universal dylib（lipo 合并，单文件
+#     双架构，宿主按 entry 基础名加载时两种 Mac 通吃）。
 #   * 发 release：Actions 页面 → Run workflow（workflow_dispatch），
 #     可选 bump 档位（none/patch/minor/major，默认 none = 用 main 上
 #     plugin.json 的当前版本）。流程：三平台构建 → 打包 → 打 tag v<ver> →
@@ -41,8 +43,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - { label: windows-x86_64-msvc, os: windows-latest, artifact: your_mic_is_peaking.dll }
           - { label: linux-x86_64, os: ubuntu-latest, artifact: your_mic_is_peaking.so }
-          - { label: macos-aarch64, os: macos-latest, artifact: your_mic_is_peaking.dylib }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
@@ -66,9 +68,8 @@ jobs:
         run: |
           mkdir -p stage
           case "${{ matrix.artifact }}" in
-            your_mic_is_peaking.dylib) cp target/release/libyour_mic_is_peaking.dylib stage/your_mic_is_peaking.dylib ;;
-            your_mic_is_peaking.so)    cp target/release/libyour_mic_is_peaking.so    stage/your_mic_is_peaking.so ;;
-            *)                         cp target/release/${{ matrix.artifact }} stage/ ;;
+            your_mic_is_peaking.so) cp target/release/libyour_mic_is_peaking.so stage/your_mic_is_peaking.so ;;
+            *)                      cp target/release/${{ matrix.artifact }} stage/ ;;
           esac
           ls -la stage/
 
@@ -79,65 +80,55 @@ jobs:
           name: lib-${{ matrix.label }}
           path: stage/${{ matrix.artifact }}
 
-  # 仓库名以「.」结尾：Windows runner 的工作区目录（D:\a\your-mic-is-peaking.\…）
-  # 无法被 NTFS 创建（尾点被 Win32 路径规范化剥离），actions/checkout 必然失败，
-  # 因此 Windows 产物改为在 ubuntu 上用 MinGW-w64 交叉编译（x86_64-pc-windows-gnu，
-  # 静态 CRT）。插件仅以纯 C ABI 与宿主交互、所有 FFI 入口 catch_unwind、无跨模块
-  # 堆分配，GNU/MSVC 工具链产物对宿主（libloading/LoadLibrary）完全等价；CI 用
-  # objdump 校验 DLL 只依赖系统库。单元测试为平台无关的纯 DSP 数学，已由
-  # linux/macos 原生 job 覆盖。
-  build-windows:
-    name: 构建 windows-x86_64（MinGW 交叉编译）
-    runs-on: ubuntu-latest
+  # macOS：同一 dylib 内含 arm64（Apple Silicon）+ x86_64（Intel Mac）两个切片，
+  # lipo 合并为 universal binary。宿主 entry 按平台补 .dylib 后缀即可两种 Mac 通吃。
+  build-macos:
+    name: 构建 macos-universal（arm64 + x86_64）
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.ref_name }}
 
-      - name: 安装 Rust 工具链 + windows-gnu 目标
+      - name: 安装 Rust 工具链 + 双架构目标
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-gnu
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - name: 缓存 Cargo 依赖
         uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ runner.os }}-windows-gnu
 
-      - name: 安装 MinGW-w64 交叉工具链
-        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
+      - name: 单元测试（宿主架构）
+        run: cargo test --release
 
-      - name: Release 构建（静态 CRT）
-        env:
-          RUSTFLAGS: "-C target-feature=+crt-static"
-        run: cargo build --release --target x86_64-pc-windows-gnu
-
-      - name: 校验 DLL 导入表（仅系统库，无 MinGW 运行时依赖）
+      - name: Release 构建（arm64 + x86_64）
         run: |
-          DLL=target/x86_64-pc-windows-gnu/release/your_mic_is_peaking.dll
-          test -f "$DLL"
-          x86_64-w64-mingw32-objdump -p "$DLL" | grep "DLL Name" | tee /tmp/imports.txt
-          ! grep -Ei "mingw|libgcc|libwinpthread|libstdc" /tmp/imports.txt
-          # 导出符号完整性（宿主按名解析）
-          x86_64-w64-mingw32-objdump -p "$DLL" | grep -E "micyou_plugin_(info|init|deinit|process|handle_message)" | tee /tmp/exports.txt
-          test $(wc -l < /tmp/exports.txt) -ge 5
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
 
-      - name: 归一化产物名
+      - name: lipo 合并为 universal dylib
         run: |
           mkdir -p stage
-          cp target/x86_64-pc-windows-gnu/release/your_mic_is_peaking.dll stage/
+          lipo -create \
+            target/aarch64-apple-darwin/release/libyour_mic_is_peaking.dylib \
+            target/x86_64-apple-darwin/release/libyour_mic_is_peaking.dylib \
+            -output stage/your_mic_is_peaking.dylib
+          lipo -info stage/your_mic_is_peaking.dylib
+          # 双架构切片缺一不可
+          lipo -archs stage/your_mic_is_peaking.dylib | grep -q arm64
+          lipo -archs stage/your_mic_is_peaking.dylib | grep -q x86_64
           ls -la stage/
 
       - name: 上传平台产物
         uses: actions/upload-artifact@v7
         with:
-          name: lib-windows-x86_64
-          path: stage/your_mic_is_peaking.dll
+          name: lib-macos-universal
+          path: stage/your_mic_is_peaking.dylib
 
   dev-package:
     name: development 包（仅 push）
     if: github.event_name == 'push'
-    needs: [build, build-windows]
+    needs: [build, build-macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -179,7 +170,7 @@ jobs:
   release:
     name: 手动发布 Release
     if: github.event_name == 'workflow_dispatch'
-    needs: [build, build-windows]
+    needs: [build, build-macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -247,7 +238,7 @@ jobs:
           python3 - "$VER" <<'PY'
           import json, sys
           ver = sys.argv[1]
-          expect = "https://github.com/OrientCOMPASS/your-mic-is-peaking./releases/latest/download/plugin.zip"
+          expect = "https://github.com/OrientCOMPASS/your-mic-is-peaking/releases/latest/download/plugin.zip"
           m = json.load(open('plugin.json'))
           assert m['version'] == ver, f"manifest version {m['version']} != {ver}"
           assert m.get('downloadUrl') == expect, \
@@ -264,7 +255,7 @@ jobs:
           LAST=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
           if [ -n "$LAST" ]; then git log --oneline "$LAST..HEAD" > /tmp/notes.md; else git log --oneline -20 > /tmp/notes.md; fi
           echo "" >> /tmp/notes.md
-          echo "三平台单包：windows x86_64 / linux x86_64 / macos aarch64。主包固定名 plugin.zip（不带版本号），更新/下载统一走 releases/latest/download/plugin.zip。release 的 plugin.json 资产可直接用于向 MicYou-Plugins 提手动市场 PR。" >> /tmp/notes.md
+          echo "三平台单包：windows x86_64 (MSVC) / linux x86_64 / macos universal (arm64 + x86_64)。主包固定名 plugin.zip（不带版本号），更新/下载统一走 releases/latest/download/plugin.zip。release 的 plugin.json 资产可直接用于向 MicYou-Plugins 提手动市场 PR。" >> /tmp/notes.md
 
       - name: 打 tag 并发布 Release
         run: |

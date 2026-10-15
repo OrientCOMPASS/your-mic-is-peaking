@@ -6,11 +6,11 @@
 |---|---|
 | 插件 id | `opss.your-mic-is-peaking` |
 | 运行时 | Native（cdylib，C ABI v1 / apiVersion 1） |
-| 平台 | **Windows（x86_64）· Linux（x86_64）· macOS（arm64）**；三平台动态库同包分发，宿主按平台自选 |
+| 平台 | **Windows（x86_64，原生 MSVC）· Linux（x86_64）· macOS（universal dylib：arm64 + x86_64）**；三平台动态库同包分发，宿主按平台自选 |
 | 插件类型 | `dsp`（实时处理链节点，`realtimeSafe: true`） |
 | 权限 | `dsp.node`、`config.read`、`config.write`（最小化，无网络/剪贴板/文件权限） |
-| 构建 | GitHub Actions · ubuntu（Windows 为 MinGW-w64 交叉编译、静态 CRT）/ ubuntu / macos-latest |
-| 依赖 | 无外部运行库（纯 Rust + serde_json；单文件 ~300 KB，Windows DLL 仅依赖系统库，CI objdump 校验） |
+| 构建 | GitHub Actions · windows-latest（原生 MSVC）/ ubuntu-latest / macos-latest（lipo 双架构合并） |
+| 依赖 | 无外部运行库（纯 Rust + serde_json；单文件 ~300 KB） |
 | 许可 | Unlicense（公有领域） |
 
 ## 安装
@@ -23,11 +23,13 @@
 
 ## 使用
 
-1. 按 **`Ctrl+Shift+F9`**（默认，可改）→ 系统通知「💥 炸麦开启」，麦克风立刻进入破音失真状态
-2. 在**任何**应用里再按同一快捷键 → 「🎙️ 炸麦关闭」，10 ms 淡出恢复干净声音，无咔哒
+1. 按 **`Ctrl+Shift+F9`**（默认，可改）→ 系统通知「💥 炸麦开启」，麦克风**当帧立刻**进入破音失真状态
+2. 在**任何**应用里再按同一快捷键 → 「🎙️ 炸麦关闭」，**当帧立刻**恢复干净信号
 3. 也可以打开侧边栏面板（💥 YourMicIsPeaking）用大按钮开关、实时调「炸裂强度」与「效果比例」
 
 > **效果只在串流运行时送达对方**：MicYou 需要已连接手机/Web 端（音频线程在处理链上调用本插件）。未串流时开关状态照常切换，声音在开始串流后生效。
+>
+> 开关为**瞬时切换**（无淡入淡出）：响应零延迟。响度匹配增益在激活首帧即完成初始化，切换不会带来音量跳变；波形接续点可能有一次样本级跳变——这正是真实「拍炸麦克风」的瞬间爆裂感，刻意保留。
 
 ## 参数
 
@@ -44,7 +46,7 @@
 
 1. **削波失真**：`y = hard_clip(x · drive)` —— 波形顶被拍平成方波状，产生大量高次谐波（撕裂感）与帧内动态压平，这正是过载麦克风的声音特征；
 2. **响度匹配**：每帧统计输入均方与湿信号均方，计算 `makeup = sqrt(in_ms / wet_ms)`（τ = 20 ms 平滑、静音门限保持、激活首帧即收敛），输出 `y · makeup` 的 RMS **恰好等于输入 RMS**——音量不变，只有音色被炸；
-3. **无感开关**：10 ms 干湿交叉淡变包络，开/关都不会有咔哒声。
+3. **瞬时开关**：关闭当帧立即旁路、开启当帧全量炸麦，零延迟。响度匹配增益在激活首帧即以当帧统计初始化，切换不带来音量跳变；波形接续点可能有一次样本级跳变——这正是真实「拍炸麦克风」的瞬间爆裂感，刻意保留（不做淡入淡出）。
 
 全程零分配、零宿主调用、无锁参数读取，满足实时 DSP 规范（单帧处理 ≪ 1 ms）。
 
@@ -60,7 +62,7 @@
 ## 开发
 
 ```bash
-cargo test --release     # DSP 核心单元测试（响度匹配 / 谐波 / 淡变 / 边界）
+cargo test --release     # DSP 核心单元测试（响度匹配 / 谐波 / 瞬时开关 / 边界）
 cargo build --release    # 产物 target/release/libyour_mic_is_peaking.{so,dylib} / your_mic_is_peaking.dll
 ```
 
@@ -69,13 +71,11 @@ CI（`.github/workflows/release.yml`）：
 - push 到 `main` / `dev` → 三平台矩阵编译 + 单测，产物上传为 artifact `your-mic-is-peaking-development`（可直接解压安装的完整插件包）
 - Actions 页面手动 Run workflow → 打 tag 并创建 Release（资产 `plugin.zip` + `plugin.json`）
 
-> **Windows 产物为何是交叉编译**：本仓库名以 `.` 结尾，Windows runner 的工作区
-> 目录（`D:\a\your-mic-is-peaking.\…`）无法被 NTFS 创建（Win32 路径规范化剥离
-> 尾点），`actions/checkout` 在 windows-latest 上必然失败。因此 Windows DLL 在
-> ubuntu 上以 `x86_64-pc-windows-gnu` + 静态 CRT 交叉编译——插件仅以纯 C ABI
-> 与宿主交互、所有 FFI 入口 `catch_unwind`、无跨模块堆分配，与 MSVC 产物对
-> 宿主（libloading/LoadLibrary）完全等价；CI 用 objdump 校验导入表只含系统库、
-> 导出符号完整。平台无关的 DSP 单元测试由 linux/macos 原生 job 覆盖。
+> **macOS universal dylib**：macos-latest（arm64）上分别以
+> `aarch64-apple-darwin` 与 `x86_64-apple-darwin` 构建，再用 `lipo -create`
+> 合并为单个 universal dylib（Apple Silicon + Intel Mac 通吃），CI 用
+> `lipo -archs` 校验双切片齐全。Windows 为 windows-latest 原生 MSVC 构建，
+> Linux 为 ubuntu-latest 原生构建；平台无关的 DSP 单元测试在三平台各跑一遍。
 
 ## 许可
 

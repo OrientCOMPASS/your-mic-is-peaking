@@ -12,7 +12,7 @@
 * 帧内动态被压平 → 趋近方波，波峰因数（crest factor）从正弦的 1.414 掉到 ≈1.0；
 * 一切发生在**不改变整体音量**的前提下（需求：实际音量保持输入音量大小）。
 
-因此本插件 = **硬削波失真 + 逐帧 RMS 响度匹配**，外加无咔哒的开关淡变。
+因此本插件 = **硬削波失真 + 逐帧 RMS 响度匹配**，外加零延迟的瞬时开关。
 
 ## 2. 每帧处理流程（两遍，原地，零分配）
 
@@ -32,9 +32,11 @@ Pass 1（统计，数据不动）
         α = 1 − exp(−dt / τ),  τ = 20 ms,  dt = 帧时长
 
 Pass 2（应用）
-    env → 向目标（active ? 1 : 0）以 1/480 每样本步进   # 10 ms 交叉淡变
-    w   = env · mix
-    out = x·(1−w) + hard_clip(x·drive)·makeup·w
+    out = x·(1−mix) + hard_clip(x·drive)·makeup·mix    # 静态干湿混合
+
+开关（瞬时，无淡变）
+    active=false → 立即旁路（bypass，数据不碰）
+    active=true  → 当帧全量生效；makeup 于激活首帧以当帧统计初始化
 ```
 
 稳态时 `mean(out²) = wet_ms · makeup² = in_ms`——**输出帧 RMS 恒等于输入帧
@@ -51,7 +53,7 @@ RMS**，响度保持是数学恒等式而非近似；τ=20 ms 的一阶平滑只
 | RMS 匹配而非峰值匹配 | 需求是「音量」保持——响度感知对应 RMS/能量；峰值匹配会让深度削波时输出变得极小声 |
 | 静音门限（−100 dBFS）| `0/0` 数值保护 + 不把底噪当信号放大；门限以下 makeup 冻结，说话恢复时增益立即可用 |
 | makeup 限幅 [1/1024, 8] | 病态帧（极端电平）下的安全网；正常语音 RMS 范围内永不触顶 |
-| 淡变 10 ms / 平滑 τ 20 ms | 淡变短于一个音高周期（1 kHz = 1 ms ×10）不会引入可闻调制；τ 足够快以跟上音节动态、又足够慢以消除逐帧增益抖动（泵机效应） |
+| 瞬时开关（无淡入淡出） | 一键炸麦要的就是零延迟的爆裂感：关闭当帧旁路、开启当帧全量。响度不会跳变（makeup 激活首帧即按当帧统计初始化）；波形接续点的一次样本级跳变正是「麦被拍炸」瞬间的性格，刻意保留。τ=20 ms 的 makeup 平滑只作用于响度匹配，足够快以跟上音节动态、又足够慢以消除逐帧增益抖动（泵机效应） |
 
 ### 自然感：安静片段不炸
 
@@ -64,14 +66,14 @@ RMS**，响度保持是数学恒等式而非近似；τ=20 ms 的一阶平滑只
 
 * `process` 全程：3 次原子读（active/drive/mix）+ 两遍逐样本乘加，无堆分配、
   无锁、无系统调用、无宿主 API 调用；`exp` 每帧一次；
-* 处理状态 `Peaker`（env/makeup/was_active）放在 `UnsafeCell` 静态中，仅宿主
+* 处理状态 `Peaker`（makeup/was_active）放在 `UnsafeCell` 静态中，仅宿主
   实时音频线程触碰（`process` 串行执行）；init/deinit 的重置发生在链注册/注销
   的静默窗口内（宿主注销 DSP 节点会等待在途帧结束）；
 * 所有 FFI 入口 `catch_unwind`，panic 绝不跨 ABI 边界（cdylib 与宿主同进程，
   `panic=abort` 被明确禁止——见 Cargo.toml 注释）;
 * 输入含 NaN/±inf 时按 0 处理并输出有限值；宿主在节点输出后还有一道
   NaN 消毒（`micyou-plugin/dsp.rs run_node`），双保险；
-* 空闲快速路径：未激活且淡出结束 → `bypass=1`，宿主整帧跳过，零开销。
+* 空闲快速路径：未激活 → 当帧立即 `bypass=1`，宿主整帧跳过，零开销。
 
 ## 5. 线程与状态
 
@@ -99,9 +101,10 @@ DSP 核心是纯函数式的 `Peaker::process`，单测在任何平台 `cargo te
 | `distortion_is_clearly_audible` | Goertzel h3/h1 功率比 > 1%；波峰因数被压平（< 1.25 且显著低于输入） |
 | `loudness_tracks_input_envelope` | 幅度指数爬升时每帧 RMS 跟随偏差 < 12% |
 | `silence_in_silence_out_and_noise_floor_never_boosted` | 零输入零输出、makeup 不初始化；−80 dBFS 底噪不被放大 |
-| `activation_has_no_loudness_blast` | 播放中激活，全程峰值不超过输入峰值（首帧即匹配，无冲击） |
-| `deactivation_fades_out_without_clicks` | 干湿差异最大的场景下相邻样本差 < 0.1（无咔哒），10 ms 后回到旁路且数据原样 |
-| `mix_zero_is_transparent` | mix=0 逐样本精确透明 |
+| `activation_is_immediate_and_loudness_matched` | 激活首帧削波样本已全部拍在 ±makeup 平台（无渐入）、RMS 比 ∈ 1±8%、全程峰值不超过输入峰值（无响度冲击） |
+| `deactivation_bypasses_immediately_and_data_untouched` | 关闭后下一次 process 立即旁路且数据逐位原样（确定性断言，无波形启发式），重开当帧再生效 |
+| `output_matches_reference_formula_exactly` | 稳态输出逐位等于 `hard_clip(x·drive)·makeup` 参考公式 |
+| `mix_zero_bypasses_transparently` | mix=0 直接旁路、数据逐位原样 |
 | `drive_one_is_clean_and_loudness_neutral` | drive=1 无谐波、RMS 比 1±2% |
 | `nan_and_inf_inputs_are_sanitized` | 病态输入下输出全有限 |
 | `hot_input_stays_bounded` | 已过载输入（±2 方波）输出 RMS 仍匹配、峰值有界 |

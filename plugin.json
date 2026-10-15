@@ -107,9 +107,9 @@
       }
     ]
   },
-  "repository": "https://github.com/OrientCOMPASS/your-mic-is-peaking.",
-  "homepage": "https://github.com/OrientCOMPASS/your-mic-is-peaking.",
-  "updateUrl": "https://github.com/OrientCOMPASS/your-mic-is-peaking./releases/latest/download/plugin.json",
-  "downloadUrl": "https://github.com/OrientCOMPASS/your-mic-is-peaking./releases/latest/download/plugin.zip",
-  "readmeUrl": "https://raw.githubusercontent.com/OrientCOMPASS/your-mic-is-peaking./refs/heads/main/README.md"
+  "repository": "https://github.com/OrientCOMPASS/your-mic-is-peaking",
+  "homepage": "https://github.com/OrientCOMPASS/your-mic-is-peaking",
+  "updateUrl": "https://github.com/OrientCOMPASS/your-mic-is-peaking/releases/latest/download/plugin.json",
+  "downloadUrl": "https://github.com/OrientCOMPASS/your-mic-is-peaking/releases/latest/download/plugin.zip",
+  "readmeUrl": "https://raw.githubusercontent.com/OrientCOMPASS/your-mic-is-peaking/refs/heads/main/README.md"
 }
