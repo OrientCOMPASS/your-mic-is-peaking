@@ -9,8 +9,8 @@
 | 平台 | **Windows（x86_64）· Linux（x86_64）· macOS（arm64）**；三平台动态库同包分发，宿主按平台自选 |
 | 插件类型 | `dsp`（实时处理链节点，`realtimeSafe: true`） |
 | 权限 | `dsp.node`、`config.read`、`config.write`（最小化，无网络/剪贴板/文件权限） |
-| 构建 | GitHub Actions · windows-latest / ubuntu-latest / macos-latest |
-| 依赖 | 无外部运行库（纯 Rust + serde_json；单文件 ~300 KB） |
+| 构建 | GitHub Actions · ubuntu（Windows 为 MinGW-w64 交叉编译、静态 CRT）/ ubuntu / macos-latest |
+| 依赖 | 无外部运行库（纯 Rust + serde_json；单文件 ~300 KB，Windows DLL 仅依赖系统库，CI objdump 校验） |
 | 许可 | Unlicense（公有领域） |
 
 ## 安装
@@ -68,6 +68,14 @@ CI（`.github/workflows/release.yml`）：
 
 - push 到 `main` / `dev` → 三平台矩阵编译 + 单测，产物上传为 artifact `your-mic-is-peaking-development`（可直接解压安装的完整插件包）
 - Actions 页面手动 Run workflow → 打 tag 并创建 Release（资产 `plugin.zip` + `plugin.json`）
+
+> **Windows 产物为何是交叉编译**：本仓库名以 `.` 结尾，Windows runner 的工作区
+> 目录（`D:\a\your-mic-is-peaking.\…`）无法被 NTFS 创建（Win32 路径规范化剥离
+> 尾点），`actions/checkout` 在 windows-latest 上必然失败。因此 Windows DLL 在
+> ubuntu 上以 `x86_64-pc-windows-gnu` + 静态 CRT 交叉编译——插件仅以纯 C ABI
+> 与宿主交互、所有 FFI 入口 `catch_unwind`、无跨模块堆分配，与 MSVC 产物对
+> 宿主（libloading/LoadLibrary）完全等价；CI 用 objdump 校验导入表只含系统库、
+> 导出符号完整。平台无关的 DSP 单元测试由 linux/macos 原生 job 覆盖。
 
 ## 许可
 
