@@ -333,9 +333,12 @@ mod tests {
     }
 
     #[test]
-    fn deactivation_fades_out_without_clicks() {
-        // 稳态炸麦中关闭：干湿波形差异大（方波 vs 正弦），若瞬间切换会出现
-        // 样本间跳变（咔哒）。10 ms 交叉淡变下相邻样本差应远小于波形差。
+    fn deactivation_crossfades_back_to_dry() {
+        // 稳态炸麦中关闭：验证 10 ms 交叉淡变的机制本身——中点必须是干/湿
+        // 按包络的精确混合（瞬切会直接等于干信号）、帧尾完全回到干信号、
+        // 全程不超出干/湿的凸组合界（无过冲），随后恢复旁路且数据原样。
+        // 注：不用「相邻样本差」做咔哒启发式——削波方波自身在极性翻转处
+        // 就有 ~2×makeup 的固有步进，会淹没瞬切伪影。
         let mut peaker = Peaker::new();
         let on = Params { active: true, drive: 24.0, mix: 1.0 };
         let off = Params { active: false, drive: 24.0, mix: 1.0 };
@@ -352,44 +355,41 @@ mod tests {
             *phase += frame;
             buf
         };
-        // 收敛到稳态。
+        // 收敛到稳态，记录 makeup。
         for _ in 0..40 {
             let mut buf = sine_frame(&mut phase);
             peaker.process(&mut buf, 1, &on);
         }
-        let mut prev = {
-            let mut buf = sine_frame(&mut phase);
-            peaker.process(&mut buf, 1, &on);
-            buf[frame - 1]
-        };
-        let mut max_step = 0f32;
-        let mut bypass_after = None;
-        for f in 0..4 {
-            let mut buf = sine_frame(&mut phase);
-            let processed = peaker.process(&mut buf, 1, &off);
-            if !processed && bypass_after.is_none() {
-                bypass_after = Some(f);
-            }
-            if processed {
-                for &x in buf.iter() {
-                    max_step = max_step.max((x - prev).abs());
-                    prev = x;
-                }
-            }
+        let makeup = peaker.makeup();
+        assert!(makeup.is_finite() && makeup > 0.0, "makeup={makeup}");
+
+        // 第一个 OFF 帧：交叉淡变进行中。
+        let dry = sine_frame(&mut phase);
+        let mut buf = dry.clone();
+        assert!(peaker.process(&mut buf, 1, &off), "淡变帧不应旁路");
+
+        for i in 0..frame {
+            let wet = hard_clip(dry[i] * 24.0) * makeup;
+            // 凸组合界：输出永不超过干/湿较大者（无过冲、无爆音）。
+            let bound = dry[i].abs().max(wet.abs()) + 1e-5;
+            assert!(buf[i].abs() <= bound, "样本 {i} 越出凸组合界");
+            // 精确包络：env 每样本先行进 1/480，故第 i 个样本 w = 1-(i+1)/480。
+            let w = 1.0 - (i as f32 + 1.0) / FADE_SAMPLES;
+            let expected = dry[i] + (wet - dry[i]) * w;
+            assert!(
+                (buf[i] - expected).abs() < 1e-3,
+                "样本 {i} 未按包络交叉淡变：{} vs {expected}",
+                buf[i]
+            );
         }
-        // 10 ms 淡出应已回到旁路（最多 2 帧余量，含 f32 舍入残留）。
-        assert!(
-            bypass_after.is_some_and(|f| f <= 2),
-            "淡出后未及时旁路：{bypass_after:?}"
-        );
-        // 干信号 1 kHz 正弦本身样本间步进 ≤ 2π·1k/48k·0.3 ≈ 0.039；
-        // 淡变斜率贡献 ≤ (0.3+0.3)/480 ≈ 0.0013。瞬间切换则会有 ~0.5 的跳变。
-        assert!(max_step < 0.1, "淡出出现咔哒：max_step={max_step}");
-        // 旁路后数据必须原样。
-        let mut buf = sine_frame(&mut phase);
-        let before = buf.clone();
-        assert!(!peaker.process(&mut buf, 1, &off));
-        assert_eq!(buf, before);
+        // 帧尾包络归零：输出精确等于干信号。
+        assert_eq!(buf[frame - 1], dry[frame - 1]);
+
+        // 第二帧恢复旁路，数据原样。
+        let dry2 = sine_frame(&mut phase);
+        let mut buf2 = dry2.clone();
+        assert!(!peaker.process(&mut buf2, 1, &off), "淡出结束后应旁路");
+        assert_eq!(buf2, dry2);
     }
 
     #[test]
