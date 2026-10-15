@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>YourMicIsPeaking</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 18px 20px 28px;
+    font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    color: hsl(var(--on-surface));
+    background: transparent;
+    font-size: 14px; line-height: 1.55;
+  }
+  h2 { margin: 0 0 2px; font-size: 17px; display: flex; align-items: center; gap: 8px; }
+  .sub { color: hsl(var(--on-surface-variant)); font-size: 12px; margin-bottom: 16px; }
+  .card {
+    border: 1px solid hsl(var(--border));
+    background: hsl(var(--surface-container));
+    border-radius: 14px; padding: 14px 16px; margin-bottom: 14px;
+  }
+  .status-row { display: flex; align-items: center; gap: 10px; }
+  .dot { width: 12px; height: 12px; border-radius: 50%; flex: none; background: hsl(var(--outline)); }
+  .dot.active { background: #e53935; box-shadow: 0 0 0 4px rgba(229,57,53,.18); animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity: .45; } }
+  .phase { font-weight: 600; font-size: 15px; }
+  .err {
+    display: none; margin-top: 10px; padding: 8px 12px; border-radius: 10px;
+    background: hsl(var(--error) / .1); color: hsl(var(--error)); font-size: 12.5px;
+    white-space: pre-wrap;
+  }
+  .bigbtn {
+    display: block; width: 100%; margin-top: 12px;
+    border: 1px solid hsl(var(--outline)); background: hsl(var(--primary));
+    color: hsl(var(--on-primary)); padding: 13px 18px; border-radius: 14px;
+    font-size: 15.5px; font-weight: 700; cursor: pointer;
+  }
+  .bigbtn.active { background: hsl(var(--error)); color: #fff; border-color: transparent; animation: pulse 1s infinite; }
+  .row { display: flex; align-items: center; gap: 12px; margin: 10px 0; }
+  .row label { flex: none; min-width: 86px; color: hsl(var(--on-surface-variant)); }
+  input[type=range] { flex: 1; accent-color: hsl(var(--primary)); }
+  .val { min-width: 52px; text-align: right; font-variant-numeric: tabular-nums; }
+  button {
+    border: 1px solid hsl(var(--outline)); background: hsl(var(--surface-bright));
+    color: hsl(var(--on-surface)); padding: 8px 18px; border-radius: 999px;
+    font-size: 13.5px; cursor: pointer;
+    white-space: nowrap; flex: none;
+  }
+  button.capturing { background: hsl(var(--error)); color: #fff; border-color: transparent; animation: pulse 1s infinite; }
+  kbd {
+    background: hsl(var(--surface-variant)); border: 1px solid hsl(var(--outline));
+    border-bottom-width: 2px; border-radius: 6px; padding: 1px 7px;
+    font-family: ui-monospace, Consolas, monospace; font-size: 12px;
+    white-space: nowrap; flex: none; max-width: 100%; overflow-x: auto;
+  }
+  .hint { color: hsl(var(--on-surface-variant)); font-size: 12px; margin-top: 6px; }
+  ol { margin: 6px 0 0; padding-left: 20px; }
+  li { margin: 3px 0; }
+  .switch { display:flex; align-items:center; gap:8px; }
+  .switch input { accent-color: hsl(var(--primary)); width:16px; height:16px; }
+</style>
+</head>
+<body>
+  <h2>💥 YourMicIsPeaking</h2>
+  <div class="sub" id="subTitle"></div>
+
+  <div class="card">
+    <div class="status-row">
+      <span class="dot" id="dot"></span>
+      <span class="phase" id="phaseText"></span>
+      <span style="flex:1"></span>
+      <kbd id="hotkeyVal">?</kbd>
+    </div>
+    <button class="bigbtn" id="toggleBtn"></button>
+    <div class="err" id="errBox"></div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <label id="hotkeyLabel"></label>
+      <kbd id="hotkeyVal2">?</kbd>
+      <span style="flex:1"></span>
+      <button id="captureBtn"></button>
+    </div>
+    <div class="hint" id="hotkeyHint"></div>
+    <div class="row">
+      <label id="driveLabel"></label>
+      <input type="range" id="drive" min="4" max="64" step="1" value="24" />
+      <span class="val" id="driveVal">×24</span>
+    </div>
+    <div class="row">
+      <label id="mixLabel"></label>
+      <input type="range" id="mix" min="0" max="1" step="0.05" value="1" />
+      <span class="val" id="mixVal">100%</span>
+    </div>
+    <div class="row switch">
+      <input type="checkbox" id="notifyChk" checked />
+      <label for="notifyChk" id="notifyLabel" style="min-width:0"></label>
+    </div>
+  </div>
+
+  <div class="card">
+    <strong id="howTitle"></strong>
+    <ol id="howList"></ol>
+    <div class="hint" id="noteHint"></div>
+  </div>
+
+<script>
+function call(api, args) {
+  return new Promise((resolve, reject) => {
+    const id = Math.random().toString(36).slice(2);
+    const onMsg = (e) => {
+      if (e.data && e.data.__micyou === 1 && e.data.id === id) {
+        window.removeEventListener('message', onMsg);
+        e.data.ok ? resolve(e.data.value) : reject(new Error(e.data.error));
+      }
+    };
+    window.addEventListener('message', onMsg);
+    window.parent.postMessage({ __micyou: 1, id, api, args: args || {} }, '*');
+  });
+}
+
+const T = {
+  'zh-CN': {
+    sub: '一键炸麦：重度削波破音失真，输出响度自动匹配输入——只炸，不变大声',
+    idle: '待机', active: '炸麦中！',
+    toggleOn: '💥 开启炸麦', toggleOff: '🛑 停止炸麦',
+    hotkey: '快捷键', capture: '按键捕获', cancel: '取消（Esc）',
+    capturingHint: '正在捕获：按下键盘组合键（需含 ctrl/alt/shift/win 修饰键，或直接用 F 键等）…',
+    hotkeyHint: '支持 ctrl/alt/shift/win 修饰键 + 字母/数字/F1–F24/常用键（如 ctrl+shift+f9）。修改后立即生效（旧组合自动失效）。鼠标侧键暂不支持。',
+    drive: '炸裂强度', mix: '效果比例', notify: '开关时弹系统通知',
+    how: '使用方法',
+    steps: [
+      '按全局快捷键（或点上方大按钮）→ 麦克风立刻进入炸麦破音状态',
+      '对方听到的音量与你的输入保持一致，只是声音「炸了」',
+      '再按一次快捷键（或再点按钮）→ 恢复正常；开关均有 10 ms 淡变，无咔哒声',
+    ],
+    note: '提示：效果只在 MicYou 串流运行时送达对方（音频线程在处理链上调用本插件）。建议把本插件节点保持在处理链末尾（VAD 之后），避免宿主降噪/AGC 抹平失真。安静片段不会炸——只有顶到削波的声音才破音，听感更自然。',
+    errPrefix: '错误：',
+  },
+  en: {
+    sub: 'One-key mic peaking: hard-clipping distortion with output loudness auto-matched to the input — it blows up without getting louder',
+    idle: 'Idle', active: 'PEAKING!',
+    toggleOn: '💥 Start peaking', toggleOff: '🛑 Stop peaking',
+    hotkey: 'Hotkey', capture: 'Capture keys', cancel: 'Cancel (Esc)',
+    capturingHint: 'Listening: press a key combo (include a ctrl/alt/shift/win modifier, or use an F-key etc.)…',
+    hotkeyHint: 'Supports ctrl/alt/shift/win modifiers + letters/digits/F1–F24/common keys (e.g. ctrl+shift+f9). Changes apply immediately (the old combo stops working). Mouse side buttons are not supported yet.',
+    drive: 'Drive', mix: 'Mix', notify: 'System notifications on toggle',
+    how: 'How to use',
+    steps: [
+      'Press the global hotkey (or the big button above) — your mic instantly blows up into clipping distortion',
+      'Peers hear the same loudness as your input; only the timbre is destroyed',
+      'Press again to return to normal; both directions cross-fade over 10 ms (click-free)',
+    ],
+    note: 'Note: the effect only reaches peers while MicYou is streaming. Keep this plugin node at the end of the processing chain (after VAD) so host noise reduction / AGC does not smooth the distortion away. Quiet passages stay clean — only signal that actually hits the ceiling peaks, which sounds more natural.',
+    errPrefix: 'Error: ',
+  },
+};
+let t = T['zh-CN'];
+const $ = (id) => document.getElementById(id);
+let lastDrive = 24, lastMix = 1;
+
+// ── hotkey capture (keyboard only; mouse support planned host-side) ──
+let captureMode = false;
+
+function codeToToken(code) {
+  if (/^Key[A-Z]$/.test(code)) return code.slice(3).toLowerCase();
+  if (/^Digit[0-9]$/.test(code)) return code.slice(5);
+  if (/^F([1-9]|1[0-9]|2[0-4])$/.test(code)) return code.toLowerCase();
+  const map = {
+    Space: 'space', Enter: 'enter', NumpadEnter: 'enter', Tab: 'tab',
+    Backspace: 'backspace', Delete: 'delete', Insert: 'insert',
+    Home: 'home', End: 'end', PageUp: 'pageup', PageDown: 'pagedown',
+    ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right',
+    Minus: 'minus', Equal: 'equal', BracketLeft: 'bracketleft', BracketRight: 'bracketright',
+    Backslash: 'backslash', Semicolon: 'semicolon', Quote: 'quote',
+    Comma: 'comma', Period: 'period', Slash: 'slash', Backquote: 'backquote',
+    Pause: 'pause',
+  };
+  return map[code] || null;
+}
+
+function modsOf(e) {
+  const m = [];
+  if (e.ctrlKey) m.push('ctrl');
+  if (e.altKey) m.push('alt');
+  if (e.shiftKey) m.push('shift');
+  if (e.metaKey) m.push('win');
+  return m;
+}
+
+async function saveHotkey(str) {
+  exitCaptureMode();
+  try {
+    await call('set_config', { key: 'hotkey', value: str });
+    await call('trigger', { action: 'apply' });
+  } catch (e) { console.warn(e); }
+  setTimeout(refresh, 200);
+}
+
+function onCaptureKey(e) {
+  e.preventDefault(); e.stopPropagation();
+  if (e.code === 'Escape') { exitCaptureMode(); return; }
+  const tok = codeToToken(e.code);
+  if (!tok) return; // modifier-only press etc.: keep waiting
+  const mods = modsOf(e);
+  // Bare letters/digits would hijack typing — require a modifier for them.
+  if (mods.length === 0 && /^[a-z0-9]$/.test(tok)) return;
+  saveHotkey([...mods, tok].join('+'));
+}
+
+function enterCaptureMode() {
+  captureMode = true;
+  $('captureBtn').textContent = t.cancel;
+  $('captureBtn').classList.add('capturing');
+  $('hotkeyHint').textContent = t.capturingHint;
+  window.addEventListener('keydown', onCaptureKey, true);
+}
+function exitCaptureMode() {
+  captureMode = false;
+  $('captureBtn').textContent = t.capture;
+  $('captureBtn').classList.remove('capturing');
+  window.removeEventListener('keydown', onCaptureKey, true);
+}
+$('captureBtn').addEventListener('click', () => {
+  captureMode ? exitCaptureMode() : enterCaptureMode();
+});
+
+// ── rendering ──
+function render(cfg) {
+  const st = (cfg && cfg.ymip_status) || { active: false, hotkey: '?', hotkeyOk: false, error: '' };
+  const active = !!st.active;
+
+  $('dot').className = 'dot' + (active ? ' active' : '');
+  $('phaseText').textContent = active ? t.active : t.idle;
+  $('toggleBtn').textContent = active ? t.toggleOff : t.toggleOn;
+  $('toggleBtn').classList.toggle('active', active);
+
+  const err = st.error || '';
+  $('errBox').style.display = err ? 'block' : 'none';
+  if (err) $('errBox').textContent = t.errPrefix + err;
+
+  const hk = String(st.hotkey || '?');
+  $('hotkeyVal').textContent = hk;
+  $('hotkeyVal2').textContent = hk;
+  $('hotkeyVal').style.opacity = st.hotkeyOk === false ? '0.5' : '1';
+  if (!captureMode) $('hotkeyHint').textContent = t.hotkeyHint;
+
+  if (cfg) {
+    if (typeof cfg.drive === 'number' && Math.abs(cfg.drive - lastDrive) > 1e-6 && !$('drive').matches(':active')) {
+      $('drive').value = cfg.drive;
+    }
+    lastDrive = Number($('drive').value);
+    $('driveVal').textContent = '×' + lastDrive;
+    if (typeof cfg.mix === 'number' && Math.abs(cfg.mix - lastMix) > 1e-6 && !$('mix').matches(':active')) {
+      $('mix').value = cfg.mix;
+    }
+    lastMix = Number($('mix').value);
+    $('mixVal').textContent = Math.round(lastMix * 100) + '%';
+    if (typeof cfg.notify === 'boolean') $('notifyChk').checked = cfg.notify;
+  }
+}
+
+function applyTexts() {
+  $('subTitle').textContent = t.sub;
+  $('hotkeyLabel').textContent = t.hotkey;
+  $('driveLabel').textContent = t.drive;
+  $('mixLabel').textContent = t.mix;
+  $('notifyLabel').textContent = t.notify;
+  $('captureBtn').textContent = captureMode ? t.cancel : t.capture;
+  $('howTitle').textContent = t.how;
+  $('howList').innerHTML = t.steps.map((s) => `<li>${s}</li>`).join('');
+  $('noteHint').textContent = t.note;
+  if (!captureMode) $('hotkeyHint').textContent = t.hotkeyHint;
+}
+
+async function refresh() {
+  try {
+    const cfg = await call('get_config', {});
+    render(cfg);
+  } catch (e) { /* host unavailable yet */ }
+}
+
+$('drive').addEventListener('input', () => {
+  lastDrive = Number($('drive').value);
+  $('driveVal').textContent = '×' + lastDrive;
+});
+$('drive').addEventListener('change', async () => {
+  const v = Number($('drive').value);
+  try {
+    await call('set_config', { key: 'drive', value: v });
+    await call('trigger', { action: 'apply' });
+  } catch (e) { console.warn(e); }
+});
+$('mix').addEventListener('input', () => {
+  lastMix = Number($('mix').value);
+  $('mixVal').textContent = Math.round(lastMix * 100) + '%';
+});
+$('mix').addEventListener('change', async () => {
+  const v = Number($('mix').value);
+  try {
+    await call('set_config', { key: 'mix', value: v });
+    await call('trigger', { action: 'apply' });
+  } catch (e) { console.warn(e); }
+});
+$('notifyChk').addEventListener('change', async () => {
+  try {
+    await call('set_config', { key: 'notify', value: $('notifyChk').checked });
+    await call('trigger', { action: 'apply' });
+  } catch (e) { console.warn(e); }
+});
+$('toggleBtn').addEventListener('click', async () => {
+  try { await call('trigger', { action: 'toggle' }); } catch (e) { console.warn(e); }
+  setTimeout(refresh, 200);
+});
+
+(async function init() {
+  try {
+    const lang = await call('locale');
+    t = String(lang).startsWith('zh') ? T['zh-CN'] : T.en;
+  } catch (e) { /* keep zh-CN */ }
+  applyTexts();
+  await refresh();
+  setInterval(refresh, 1000);
+})();
+</script>
+</body>
+</html>

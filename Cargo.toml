@@ -1,0 +1,27 @@
+[package]
+name = "your-mic-is-peaking"
+version = "1.0.0"
+edition = "2021"
+license = "Unlicense"
+description = "MicYou native DSP plugin: one-key mic-peaking distortion (hard clipping) with output loudness auto-matched to the input"
+publish = false
+
+# Standalone crate: build on demand with `cargo build --release`
+# (not part of any workspace, mirrors an external plugin author's setup)
+[workspace]
+
+[lib]
+name = "your_mic_is_peaking"
+crate-type = ["cdylib"]
+
+[dependencies]
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+# 绝不设置 panic = "abort"：本 cdylib 运行在宿主进程内，abort 会直接带走整个
+# MicYou；保持 unwind 才能让 lib.rs 的 catch_unwind 把插件内部 panic 挡在
+# FFI 边界内。
