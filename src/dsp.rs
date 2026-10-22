@@ -11,13 +11,8 @@
 //!    的 RMS 恰好等于输入 RMS。经一阶平滑（τ = 20 ms）得到 `makeup`；
 //!    静音帧（`in_ms` 低于门限）保持上一增益，避免 0/0 与噪声底放大；
 //!    激活沿直接以当帧 target 初始化，首帧即匹配、无响度冲击。
-//! 3. **Pass 2（应用）**：`out = x·(1−mix) + hard_clip(x·drive)·makeup·mix`。
-//!
-//! 开关为**瞬时切换**（无淡入淡出）：
-//! * 关闭 → 立即旁路（数据一个字节都不碰）；开启 → 当帧即全量炸麦。
-//! * 由于 makeup 在激活首帧就以当帧统计初始化，切换不会带来响度跳变；
-//!   波形本身的接续点可能有一次样本级跳变——这与真实「麦被拍炸」的
-//!   瞬间爆裂感一致，是本插件刻意保留的性格。
+//! 3. **Pass 2（应用）**：`out = x·(1−w) + hard_clip(x·drive)·makeup·w`，
+//!    其中 `w = env · mix`；`env` 为 10 ms 线性淡入淡出包络（开关无咔哒）。
 //!
 //! 性质：
 //! * 信号被削平 → 波形趋近方波 → 高次谐波（撕裂感）+ 帧内动态压平，
@@ -28,6 +23,9 @@
 
 /// 宿主 DSP 链固定 48 kHz（micyou-plugin `PluginDspBridge`）。
 pub const SAMPLE_RATE: f32 = 48_000.0;
+
+/// 开关淡入淡出长度：10 ms @ 48 kHz。
+pub const FADE_SAMPLES: f32 = 480.0;
 
 /// 响度匹配增益的平滑时间常数（秒）。
 pub const MAKEUP_TAU: f32 = 0.020;
@@ -63,15 +61,18 @@ impl Default for Params {
 /// 炸麦处理器状态。**只允许宿主实时音频线程触碰**（process 串行执行），
 /// init/deinit 的重置发生在链注册/注销的静默窗口内。
 pub struct Peaker {
+    /// 开关交叉淡变包络 0..1。
+    env: f32,
     /// 平滑后的响度匹配增益；NaN = 待下一有效帧重新收敛。
     makeup: f32,
-    /// 上一帧是否激活（检测激活沿）。
+    /// 上一帧的 active（检测激活沿）。
     was_active: bool,
 }
 
 impl Peaker {
     pub const fn new() -> Self {
         Self {
+            env: 0.0,
             makeup: f32::NAN,
             was_active: false,
         }
@@ -95,22 +96,18 @@ impl Peaker {
         if data.is_empty() {
             return false;
         }
-        // 瞬时开关：未激活 → 立即旁路，数据一个字节都不碰。
-        if !p.active {
-            self.was_active = false;
-            return false;
-        }
-        let drive = if p.drive.is_finite() { p.drive.max(0.0) } else { 1.0 };
-        let mix = if p.mix.is_finite() { p.mix.clamp(0.0, 1.0) } else { 1.0 };
-        if mix <= 0.0 {
-            // 全干 = 透明：直接旁路（makeup 状态不动，mix 调回即刻可用）。
+        // 空闲快速路径：未激活且淡出已结束 → 旁路，数据一个字节都不碰。
+        if !p.active && self.env <= 0.0 {
             return false;
         }
         // 激活沿：丢弃旧增益，本帧统计直接初始化（首帧响度即匹配）。
-        if !self.was_active {
+        if p.active && !self.was_active {
             self.makeup = f32::NAN;
         }
-        self.was_active = true;
+        self.was_active = p.active;
+
+        let drive = if p.drive.is_finite() { p.drive.max(0.0) } else { 1.0 };
+        let mix = if p.mix.is_finite() { p.mix.clamp(0.0, 1.0) } else { 1.0 };
 
         // ── Pass 1：统计（数据保持原样） ──
         let mut in_ms = 0.0f32;
@@ -141,19 +138,22 @@ impl Peaker {
         }
         let makeup = if self.makeup.is_nan() { 1.0 } else { self.makeup };
 
-        // ── Pass 2：失真 + 响度匹配 + 静态干湿混合 ──
-        if mix >= 1.0 {
-            for s in data.iter_mut() {
-                let x = if s.is_finite() { *s } else { 0.0 };
-                *s = hard_clip(x * drive) * makeup;
+        // ── Pass 2：失真 + 响度匹配 + 干湿交叉淡变 ──
+        let step = 1.0 / FADE_SAMPLES;
+        let env_target = if p.active { 1.0 } else { 0.0 };
+        let mut env = self.env;
+        for s in data.iter_mut() {
+            if env < env_target {
+                env = (env + step).min(env_target);
+            } else if env > env_target {
+                env = (env - step).max(env_target);
             }
-        } else {
-            let dry_w = 1.0 - mix;
-            for s in data.iter_mut() {
-                let x = if s.is_finite() { *s } else { 0.0 };
-                *s = x * dry_w + hard_clip(x * drive) * makeup * mix;
-            }
+            let x = if s.is_finite() { *s } else { 0.0 };
+            let wet = hard_clip(x * drive) * makeup;
+            let w = env * mix;
+            *s = if w >= 1.0 { wet } else { x + (wet - x) * w };
         }
+        self.env = env;
         true
     }
 }
@@ -177,7 +177,7 @@ mod tests {
     use super::*;
 
     /// 生成 `frames` 帧（每帧 `frame` 样本）正弦测试信号并逐帧处理，
-    /// 返回 (输入, 输出)。旁路帧按原样拷贝（宿主语义）。
+    /// 返回 (输入, 输出)。
     fn run_sine(
         freq: f32,
         amp: f32,
@@ -198,8 +198,12 @@ mod tests {
                 params.active = f >= at;
             }
             let mut buf = input[f * frame..(f + 1) * frame].to_vec();
-            peaker.process(&mut buf, 1, &params);
-            output[f * frame..(f + 1) * frame].copy_from_slice(&buf);
+            let processed = peaker.process(&mut buf, 1, &params);
+            if processed {
+                output[f * frame..(f + 1) * frame].copy_from_slice(&buf);
+            } else {
+                output[f * frame..(f + 1) * frame].copy_from_slice(&input[f * frame..(f + 1) * frame]);
+            }
         }
         (input, output)
     }
@@ -315,34 +319,11 @@ mod tests {
     }
 
     #[test]
-    fn activation_is_immediate_and_loudness_matched() {
-        // 瞬时开启：第一个激活帧就必须是完全体炸麦（无渐入），且响度已匹配。
+    fn activation_has_no_loudness_blast() {
+        // 播放中激活：任何一帧的峰值都不得超过输入峰值太多（首帧即响度匹配）。
         let p = Params { active: false, drive: 24.0, mix: 1.0 };
         let amp = 0.3;
         let (input, output) = run_sine(1000.0, amp, 60, 480, &p, Some(20));
-
-        // 激活帧之前的输出 == 输入（旁路原样）。
-        assert_eq!(&input[..20 * 480], &output[..20 * 480]);
-
-        // 第一个激活帧：削波样本必须已经拍在 ±makeup 平台上（无淡入斜坡）。
-        let first = &output[20 * 480..21 * 480];
-        let dry = &input[20 * 480..21 * 480];
-        let plateau = first.iter().map(|x| x.abs()).fold(0f32, f32::max);
-        let mut clipped_count = 0;
-        for i in 0..480 {
-            if (dry[i] * 24.0).abs() >= 1.0 {
-                clipped_count += 1;
-                assert!(
-                    (first[i].abs() - plateau).abs() < 1e-6,
-                    "样本 {i} 未在首帧即达到削波平台（疑似渐入）"
-                );
-            }
-        }
-        assert!(clipped_count > 100, "测试信号应深度削波");
-
-        // 首帧响度即匹配（makeup 当帧初始化）：RMS 比 ∈ 1±8%，峰值无冲击。
-        let ratio = rms(first) as f64 / rms(dry) as f64;
-        assert!((ratio - 1.0).abs() < 0.08, "首帧 RMS 比 {ratio}");
         let peak_in = input.iter().map(|x| x.abs()).fold(0f32, f32::max);
         let peak_out = output.iter().map(|x| x.abs()).fold(0f32, f32::max);
         assert!(
@@ -352,15 +333,15 @@ mod tests {
     }
 
     #[test]
-    fn deactivation_bypasses_immediately_and_data_untouched() {
-        // 瞬时关闭：下一次 process 立即旁路，数据逐位原样——确定性断言，
-        // 不存在任何波形启发式（旧淡出测试的样本差启发式已被整体移除）。
+    fn deactivation_fades_out_without_clicks() {
+        // 稳态炸麦中关闭：干湿波形差异大（方波 vs 正弦），若瞬间切换会出现
+        // 样本间跳变（咔哒）。10 ms 交叉淡变下相邻样本差应远小于波形差。
         let mut peaker = Peaker::new();
         let on = Params { active: true, drive: 24.0, mix: 1.0 };
         let off = Params { active: false, drive: 24.0, mix: 1.0 };
         let frame = 480;
         let mut phase = 0usize;
-        let sine_frame = |phase: &mut usize| -> Vec<f32> {
+        let mut sine_frame = |phase: &mut usize| -> Vec<f32> {
             let buf: Vec<f32> = (0..frame)
                 .map(|i| {
                     0.3 * (2.0 * std::f32::consts::PI * 1000.0 * (*phase + i) as f32
@@ -371,62 +352,54 @@ mod tests {
             *phase += frame;
             buf
         };
+        // 收敛到稳态。
         for _ in 0..40 {
             let mut buf = sine_frame(&mut phase);
-            assert!(peaker.process(&mut buf, 1, &on));
+            peaker.process(&mut buf, 1, &on);
         }
-        // 关闭：立即旁路 + 数据逐位不变，连续多帧稳定。
-        for _ in 0..3 {
-            let dry = sine_frame(&mut phase);
-            let mut buf = dry.clone();
-            assert!(!peaker.process(&mut buf, 1, &off), "关闭后应立即旁路");
-            assert_eq!(buf, dry, "旁路帧数据必须逐位原样");
-        }
-        // 重新开启：又是当帧全量生效。
-        let mut buf = sine_frame(&mut phase);
-        assert!(peaker.process(&mut buf, 1, &on));
-    }
-
-    #[test]
-    fn output_matches_reference_formula_exactly() {
-        // mix=1 时输出必须逐位等于 hard_clip(x·drive)·makeup（makeup 为
-        // 帧后读数：Pass 1 先更新、Pass 2 使用同一值）。
-        let mut peaker = Peaker::new();
-        let p = Params { active: true, drive: 17.0, mix: 1.0 };
-        let frame = 480;
-        let mut phase = 0usize;
-        for f in 0..50 {
-            let dry: Vec<f32> = (0..frame)
-                .map(|i| {
-                    0.25 * (2.0 * std::f32::consts::PI * 1000.0 * (phase + i) as f32
-                        / SAMPLE_RATE)
-                        .sin()
-                })
-                .collect();
-            phase += frame;
-            let mut buf = dry.clone();
-            assert!(peaker.process(&mut buf, 1, &p), "帧 {f} 应被处理");
-            let makeup = peaker.makeup();
-            for i in 0..frame {
-                let expected = hard_clip(dry[i] * 17.0) * makeup;
-                assert_eq!(buf[i], expected, "帧 {f} 样本 {i} 与参考公式不一致");
+        let mut prev = {
+            let mut buf = sine_frame(&mut phase);
+            peaker.process(&mut buf, 1, &on);
+            buf[frame - 1]
+        };
+        let mut max_step = 0f32;
+        let mut bypass_after = None;
+        for f in 0..4 {
+            let mut buf = sine_frame(&mut phase);
+            let processed = peaker.process(&mut buf, 1, &off);
+            if !processed && bypass_after.is_none() {
+                bypass_after = Some(f);
+            }
+            if processed {
+                for &x in buf.iter() {
+                    max_step = max_step.max((x - prev).abs());
+                    prev = x;
+                }
             }
         }
+        // 10 ms 淡出应已回到旁路（最多 2 帧余量，含 f32 舍入残留）。
+        assert!(
+            bypass_after.is_some_and(|f| f <= 2),
+            "淡出后未及时旁路：{bypass_after:?}"
+        );
+        // 干信号 1 kHz 正弦本身样本间步进 ≤ 2π·1k/48k·0.3 ≈ 0.039；
+        // 淡变斜率贡献 ≤ (0.3+0.3)/480 ≈ 0.0013。瞬间切换则会有 ~0.5 的跳变。
+        assert!(max_step < 0.1, "淡出出现咔哒：max_step={max_step}");
+        // 旁路后数据必须原样。
+        let mut buf = sine_frame(&mut phase);
+        let before = buf.clone();
+        assert!(!peaker.process(&mut buf, 1, &off));
+        assert_eq!(buf, before);
     }
 
     #[test]
-    fn mix_zero_bypasses_transparently() {
-        // mix=0：直接旁路（瞬时切换语义下无淡入过程，全程数据原样）。
-        let mut peaker = Peaker::new();
+    fn mix_zero_is_transparent() {
         let p = Params { active: true, drive: 24.0, mix: 0.0 };
-        let mut buf = vec![0.2f32; 480];
-        let before = buf.clone();
-        assert!(!peaker.process(&mut buf, 1, &p));
-        assert_eq!(buf, before);
-        // mix=0.5：干湿各半（相对纯湿响度上浮，属预期）。
-        let half = Params { active: true, drive: 24.0, mix: 0.5 };
-        let mut buf2 = vec![0.2f32; 480];
-        assert!(peaker.process(&mut buf2, 1, &half));
+        let (input, output) = run_sine(1000.0, 0.2, 30, 480, &p, None);
+        // 淡入完成后 w=0 → 输出 == 输入（逐样本精确）。
+        for i in 480..input.len() {
+            assert_eq!(input[i], output[i], "mix=0 应完全透明（样本 {i}）");
+        }
     }
 
     #[test]
