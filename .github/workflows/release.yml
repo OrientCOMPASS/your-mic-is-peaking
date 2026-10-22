@@ -41,7 +41,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { label: windows-x86_64-msvc, os: windows-latest, artifact: your_mic_is_peaking.dll }
           - { label: linux-x86_64, os: ubuntu-latest, artifact: your_mic_is_peaking.so }
           - { label: macos-aarch64, os: macos-latest, artifact: your_mic_is_peaking.dylib }
     runs-on: ${{ matrix.os }}
@@ -80,10 +79,65 @@ jobs:
           name: lib-${{ matrix.label }}
           path: stage/${{ matrix.artifact }}
 
+  # 仓库名以「.」结尾：Windows runner 的工作区目录（D:\a\your-mic-is-peaking.\…）
+  # 无法被 NTFS 创建（尾点被 Win32 路径规范化剥离），actions/checkout 必然失败，
+  # 因此 Windows 产物改为在 ubuntu 上用 MinGW-w64 交叉编译（x86_64-pc-windows-gnu，
+  # 静态 CRT）。插件仅以纯 C ABI 与宿主交互、所有 FFI 入口 catch_unwind、无跨模块
+  # 堆分配，GNU/MSVC 工具链产物对宿主（libloading/LoadLibrary）完全等价；CI 用
+  # objdump 校验 DLL 只依赖系统库。单元测试为平台无关的纯 DSP 数学，已由
+  # linux/macos 原生 job 覆盖。
+  build-windows:
+    name: 构建 windows-x86_64（MinGW 交叉编译）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: 安装 Rust 工具链 + windows-gnu 目标
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: 缓存 Cargo 依赖
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ runner.os }}-windows-gnu
+
+      - name: 安装 MinGW-w64 交叉工具链
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
+
+      - name: Release 构建（静态 CRT）
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
+        run: cargo build --release --target x86_64-pc-windows-gnu
+
+      - name: 校验 DLL 导入表（仅系统库，无 MinGW 运行时依赖）
+        run: |
+          DLL=target/x86_64-pc-windows-gnu/release/your_mic_is_peaking.dll
+          test -f "$DLL"
+          x86_64-w64-mingw32-objdump -p "$DLL" | grep "DLL Name" | tee /tmp/imports.txt
+          ! grep -Ei "mingw|libgcc|libwinpthread|libstdc" /tmp/imports.txt
+          # 导出符号完整性（宿主按名解析）
+          x86_64-w64-mingw32-objdump -p "$DLL" | grep -E "micyou_plugin_(info|init|deinit|process|handle_message)" | tee /tmp/exports.txt
+          test $(wc -l < /tmp/exports.txt) -ge 5
+
+      - name: 归一化产物名
+        run: |
+          mkdir -p stage
+          cp target/x86_64-pc-windows-gnu/release/your_mic_is_peaking.dll stage/
+          ls -la stage/
+
+      - name: 上传平台产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: lib-windows-x86_64
+          path: stage/your_mic_is_peaking.dll
+
   dev-package:
     name: development 包（仅 push）
     if: github.event_name == 'push'
-    needs: [build]
+    needs: [build, build-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -125,7 +179,7 @@ jobs:
   release:
     name: 手动发布 Release
     if: github.event_name == 'workflow_dispatch'
-    needs: [build]
+    needs: [build, build-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

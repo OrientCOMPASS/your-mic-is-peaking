@@ -341,7 +341,7 @@ mod tests {
         let off = Params { active: false, drive: 24.0, mix: 1.0 };
         let frame = 480;
         let mut phase = 0usize;
-        let mut sine_frame = |phase: &mut usize| -> Vec<f32> {
+        let sine_frame = |phase: &mut usize| -> Vec<f32> {
             let buf: Vec<f32> = (0..frame)
                 .map(|i| {
                     0.3 * (2.0 * std::f32::consts::PI * 1000.0 * (*phase + i) as f32

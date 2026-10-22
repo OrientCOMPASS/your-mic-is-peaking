@@ -226,7 +226,7 @@ pub fn set_panel_icon(panel_id: &str, icon: &str) {
         if let (Ok(p), Ok(i)) = (CString::new(panel_id), CString::new(icon)) {
             unsafe { f(h.ctx, p.as_ptr(), i.as_ptr()) };
         }
-    })
+    });
 }
 
 /// Read a NUL-terminated C string argument defensively (never panics).
